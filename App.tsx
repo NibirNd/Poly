@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import DashboardHeader from './components/DashboardHeader';
 import StatsPanel from './components/StatsPanel';
 import AlertCard from './components/AlertCard';
-import { getTrendingMarkets, fetchRecentTrades, analyzeTradeHeuristics, generateBacktestScenario } from './services/polymarketService';
+import { getTrendingMarkets, fetchRecentTrades, analyzeTradeHeuristics, generateBacktestScenario, fetchWalletStats } from './services/polymarketService';
 import { analyzeSuspicion } from './services/geminiService';
 import { PolymarketMarket, Trade, SuspiciousActivity, SuspicionLevel } from './types';
 import { Loader2, AlertCircle, Play, RefreshCw, Radio } from 'lucide-react';
@@ -14,8 +14,10 @@ const App: React.FC = () => {
   const [markets, setMarkets] = useState<PolymarketMarket[]>([]);
   const [statusMessage, setStatusMessage] = useState<string>('Initializing...');
   
-  // Use refs for intervals to clear them properly
+  // Refs
   const scanIntervalRef = useRef<number | null>(null);
+  const cycleRunningRef = useRef<boolean>(false);
+  const processedTradeIds = useRef<Set<string>>(new Set());
 
   const initMarkets = async () => {
     setStatusMessage('Connecting to Polymarket Data Feed...');
@@ -27,57 +29,73 @@ const App: React.FC = () => {
 
   // Process a single trade through the pipeline
   const evaluateTrade = async (trade: Trade, market: PolymarketMarket) => {
+    // Deduplication check
+    if (processedTradeIds.current.has(trade.id)) return null;
+    processedTradeIds.current.add(trade.id);
+
     const { baseScore, factors } = analyzeTradeHeuristics(trade, market);
 
-    // Heuristic threshold to trigger AI analysis
+    // Filter Threshold: Only proceed if there is some heuristic signal
     if (baseScore > 20) {
-      // For UX responsiveness, show "Analyzing" in status
-      setStatusMessage(`AI Analyzing: ${trade.size} USD on ${market.question.substring(0, 20)}...`);
+      // Fetch real wallet stats if possible
+      const realWalletStats = await fetchWalletStats(trade.makerAddress);
       
-      const analysis = await analyzeSuspicion(trade, market, factors);
+      // Add wallet freshness to heuristics if detected
+      const enrichedFactors = [...factors];
+      if (realWalletStats.accountAgeDays < 2) {
+          enrichedFactors.push("Fresh Wallet (<48h)");
+      }
+
+      // Call Gemini with enriched data
+      const analysis = await analyzeSuspicion(trade, market, enrichedFactors, realWalletStats);
       
+      // Composite Score Calculation
       const finalScore = (baseScore + analysis.suspicionScore) / 2;
+      
       let level = SuspicionLevel.LOW;
       if (finalScore > 85) level = SuspicionLevel.CRITICAL;
       else if (finalScore > 65) level = SuspicionLevel.HIGH;
       else if (finalScore > 40) level = SuspicionLevel.MEDIUM;
 
       if (level !== SuspicionLevel.LOW) {
-        const newAlert: SuspiciousActivity = {
+        return {
           id: trade.id,
           trade,
           suspicionScore: Math.round(finalScore),
           level,
           reasoning: analysis.reasoning,
-          factors: [...new Set([...factors, ...analysis.factors])],
-          walletStats: {
-            totalTrades: Math.floor(Math.random() * 50),
-            winRate: 0.65,
-            accountAgeDays: Math.floor(Math.random() * 30)
-          }
-        };
-        
-        setAlerts(prev => {
-          // Prevent duplicate alerts for the same trade ID
-          if (prev.some(a => a.id === newAlert.id)) return prev;
-          return [newAlert, ...prev].slice(0, 50);
-        });
+          factors: Array.from(new Set([...enrichedFactors, ...analysis.factors])),
+          walletStats: realWalletStats
+        } as SuspiciousActivity;
       }
     }
+    return null;
   };
 
   const runBacktest = async () => {
-    if (markets.length === 0) await initMarkets();
+    let currentMarkets = markets;
+    if (currentMarkets.length === 0) {
+        currentMarkets = await initMarkets();
+    }
     
-    // Clear previous live alerts to avoid confusion
+    if (!currentMarkets || currentMarkets.length === 0) {
+        setStatusMessage("Error: No market data available for backtest.");
+        return;
+    }
+
     setAlerts([]); 
     
     setStatusMessage('Running Historic "Maduro" Scenario...');
     const scenarioTrade = generateBacktestScenario();
-    const market = markets.find(m => m.id === scenarioTrade.marketId) || markets[0];
     
-    // Process the specific scenario
-    await evaluateTrade(scenarioTrade, market);
+    const market = currentMarkets.find(m => m.id === scenarioTrade.marketId) || currentMarkets[0];
+    
+    processedTradeIds.current.delete(scenarioTrade.id);
+    const result = await evaluateTrade(scenarioTrade, market);
+    if (result) {
+        setAlerts([result]);
+    }
+    
     setStatusMessage('Backtest Complete. Suspicious pattern identified.');
   };
 
@@ -85,7 +103,7 @@ const App: React.FC = () => {
     if (isScanning) return;
     setIsScanning(true);
     setActiveTab('live');
-    setAlerts([]); // Clear old alerts when starting fresh scan
+    setAlerts([]); 
     
     let currentMarkets = markets;
     if (markets.length === 0) {
@@ -93,37 +111,64 @@ const App: React.FC = () => {
     }
 
     const runCycle = async () => {
-      setStatusMessage('Scanning Order Books for Active Trades...');
-      const recentTrades = await fetchRecentTrades(currentMarkets);
-      
-      // Filter for potential signals
-      // We also ensure trades are RECENT (within last 30 mins) to avoid "old" data
-      const now = Date.now();
-      const THIRTY_MINS = 30 * 60 * 1000;
+      // Locking Mechanism: Prevent overlap
+      if (cycleRunningRef.current) return;
+      cycleRunningRef.current = true;
 
-      const candidates = recentTrades.filter(t => {
-        const isFresh = t.timestamp > (now - THIRTY_MINS);
-        const isSignificant = t.size > 200; // Filter dust
-        return isFresh && isSignificant;
-      });
+      try {
+        setStatusMessage('Scanning Order Books...');
+        
+        // Pass all markets; service handles batching
+        const recentTrades = await fetchRecentTrades(currentMarkets);
+        
+        const now = Date.now();
+        const ONE_HOUR = 60 * 60 * 1000; 
 
-      if (candidates.length === 0) {
-        setStatusMessage('No anomalies in current tick. Listening...');
-      }
+        const candidates = recentTrades.filter(t => {
+          const isFresh = t.timestamp > (now - ONE_HOUR);
+          const isSignificant = t.size > 100; 
+          return isFresh && isSignificant;
+        });
 
-      for (const trade of candidates) {
-        const market = currentMarkets.find(m => m.id === trade.marketId);
-        if (market) {
-          await evaluateTrade(trade, market);
+        if (candidates.length === 0) {
+          setStatusMessage('Listening for activity...');
+        } else {
+            setStatusMessage(`Analyzing ${candidates.length} active signals...`);
+            
+            // Parallel Processing using Promise.all
+            // Map trades to analysis promises
+            const analysisPromises = candidates.map(async (trade) => {
+                const market = currentMarkets.find(m => m.id === trade.marketId);
+                if (!market) return null;
+                return await evaluateTrade(trade, market);
+            });
+
+            // Wait for all to finish
+            const results = await Promise.all(analysisPromises);
+            
+            // Filter out nulls (non-suspicious) and add valid alerts
+            const validAlerts = results.filter((r): r is SuspiciousActivity => r !== null);
+            
+            if (validAlerts.length > 0) {
+                setAlerts(prev => {
+                    // Prepend new alerts
+                    return [...validAlerts, ...prev].slice(0, 50);
+                });
+            }
         }
+
+      } catch (err) {
+        console.error("Scan cycle error:", err);
+      } finally {
+        cycleRunningRef.current = false;
       }
     };
 
-    // Run immediately then interval
+    // Run immediately
     await runCycle();
     
     if (scanIntervalRef.current) clearInterval(scanIntervalRef.current);
-    scanIntervalRef.current = window.setInterval(runCycle, 6000); // 6s polling for faster "live" feel
+    scanIntervalRef.current = window.setInterval(runCycle, 8000); 
   };
 
   const stopScan = () => {
@@ -132,6 +177,7 @@ const App: React.FC = () => {
       clearInterval(scanIntervalRef.current);
       scanIntervalRef.current = null;
     }
+    cycleRunningRef.current = false;
     setStatusMessage('Scanner Paused');
   };
 
@@ -140,7 +186,6 @@ const App: React.FC = () => {
     else startLiveScan();
   };
 
-  // Initial load
   useEffect(() => {
     initMarkets();
     return () => stopScan();
@@ -173,7 +218,6 @@ const App: React.FC = () => {
                     if (activeTab !== 'live') {
                       stopScan(); 
                       setActiveTab('live');
-                      // User needs to click scan to start
                       setAlerts([]);
                     }
                   }}
@@ -205,7 +249,7 @@ const App: React.FC = () => {
                   </h3>
                   <p className="text-gray-500 mt-2 max-w-sm mx-auto">
                     {activeTab === 'live' 
-                      ? isScanning ? "Scanning active markets for unusual volume, fresh wallets, and liquidity imbalances." : "Click 'Scan Markets' to start the live feed."
+                      ? isScanning ? "Scanning active markets. Looking for statistical size anomalies (>3σ) and fresh wallets." : "Click 'Scan Markets' to start."
                       : "Click 'Backtest Demo' to simulate the Maduro election insider scenario."
                     }
                   </p>
@@ -238,7 +282,7 @@ const App: React.FC = () => {
                <div className="mt-6 bg-green-900/10 border border-green-500/20 rounded-lg p-5 animate-pulse">
                  <h4 className="text-green-400 text-sm font-bold mb-2">Live Feed Active</h4>
                  <p className="text-xs text-green-200/70 leading-relaxed">
-                   Processing order book ticks and trade events in real-time. Heuristic filters set to <strong>High Sensitivity</strong>.
+                   Z-Score Analysis running on live ticker. Batch processing active for top 20 markets.
                  </p>
                </div>
              )}

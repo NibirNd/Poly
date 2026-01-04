@@ -1,5 +1,6 @@
 export interface PolymarketMarket {
-  id: string;
+  id: string; // This will now store the conditionId (0x...) for Data API compatibility
+  gammaId: string; // The numeric/string ID from Gamma for URL linking
   question: string;
   slug: string;
   endDate: string;
@@ -11,9 +12,9 @@ export interface PolymarketMarket {
 
 export interface Trade {
   id: string;
-  marketId: string;
+  marketId: string; // conditionId
   marketQuestion: string;
-  outcomeIndex: number; // 0 or 1 usually (Yes/No)
+  outcomeIndex: number;
   outcomeLabel: string;
   side: 'BUY' | 'SELL';
   price: number;

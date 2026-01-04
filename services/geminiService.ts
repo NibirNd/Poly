@@ -13,25 +13,40 @@ const cleanJson = (text: string) => {
 export const analyzeSuspicion = async (
   trade: Trade, 
   market: PolymarketMarket, 
-  preliminaryFactors: string[]
+  preliminaryFactors: string[],
+  walletStats: any
 ): Promise<GeminiAnalysisResponse> => {
   
   const prompt = `
-    Analyze this trade for insider trading. Return ONLY valid JSON.
+    You are a forensic analyst for prediction markets. Use the provided FACTS ONLY.
     
-    Market: "${market.question}" (Vol: $${market.volume}, Liq: $${market.liquidity})
-    Trade: ${trade.side} $${trade.size} of "${trade.outcomeLabel}" @ ${(trade.price * 100).toFixed(1)} cents.
-    Wallet: ${trade.makerAddress}
-    Flags: ${preliminaryFactors.join(", ")}
+    FACTS_JSON:
+    ${JSON.stringify({
+      market: { 
+        question: market.question, 
+        volume: market.volume, 
+        liquidity: market.liquidity 
+      },
+      trade: { 
+        side: trade.side, 
+        usdcSize: trade.size, 
+        price: trade.price, 
+        outcome: trade.outcomeLabel, 
+        ts: trade.timestamp, 
+        wallet: trade.makerAddress 
+      },
+      forensics: {
+        walletAgeDays: walletStats.accountAgeDays,
+        heuristicFlags: preliminaryFactors
+      }
+    }, null, 2)}
+
+    TASK:
+    Assess if this trade indicates informed insider flow.
+    - High suspicion if: Fresh wallet (<2 days) AND large size OR known insider pattern.
+    - Medium suspicion if: High slippage acceptance or unusual outcome accumulation.
     
-    Assess if this is informed flow.
-    Output JSON structure:
-    {
-      "suspicionScore": number (0-100),
-      "reasoning": string (max 20 words),
-      "riskLevel": "LOW" | "MEDIUM" | "HIGH" | "CRITICAL",
-      "factors": string[] (max 3 short tags)
-    }
+    Return ONLY JSON.
   `;
 
   try {
@@ -39,8 +54,9 @@ export const analyzeSuspicion = async (
       model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
+        temperature: 0.1, // Deterministic
+        topP: 0.5,
         responseMimeType: "application/json",
-        // Providing schema helps the model structure the output correctly
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -51,7 +67,8 @@ export const analyzeSuspicion = async (
               type: Type.ARRAY, 
               items: { type: Type.STRING } 
             }
-          }
+          },
+          required: ["suspicionScore", "reasoning", "riskLevel", "factors"]
         }
       }
     });
@@ -64,11 +81,13 @@ export const analyzeSuspicion = async (
 
   } catch (error) {
     console.error("Gemini Analysis Failed:", error);
+    // Lower confidence fallback
+    const heuristicScore = preliminaryFactors.length * 15;
     return {
-      suspicionScore: preliminaryFactors.includes("Known Insider Wallet") ? 95 : 65,
-      reasoning: "Automated heuristic analysis (AI Offline)",
-      riskLevel: preliminaryFactors.includes("Known Insider Wallet") ? "CRITICAL" : "MEDIUM",
-      factors: preliminaryFactors
+      suspicionScore: Math.min(50, heuristicScore),
+      reasoning: "AI Unavailable - Heuristic Estimate Only",
+      riskLevel: heuristicScore > 60 ? "HIGH" : "MEDIUM",
+      factors: preliminaryFactors.slice(0, 3)
     };
   }
 };
