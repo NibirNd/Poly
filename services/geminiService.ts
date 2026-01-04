@@ -18,35 +18,22 @@ export const analyzeSuspicion = async (
 ): Promise<GeminiAnalysisResponse> => {
   
   const prompt = `
-    You are a forensic analyst for prediction markets. Use the provided FACTS ONLY.
+    You are a forensic analyst for prediction markets. 
+    ANALYZE ONLY THE PROVIDED FACTS. DO NOT HALLUCINATE.
     
-    FACTS_JSON:
-    ${JSON.stringify({
-      market: { 
-        question: market.question, 
-        volume: market.volume, 
-        liquidity: market.liquidity 
-      },
-      trade: { 
-        side: trade.side, 
-        usdcSize: trade.size, 
-        price: trade.price, 
-        outcome: trade.outcomeLabel, 
-        ts: trade.timestamp, 
-        wallet: trade.makerAddress 
-      },
-      forensics: {
-        walletAgeDays: walletStats.accountAgeDays,
-        heuristicFlags: preliminaryFactors
-      }
-    }, null, 2)}
+    FACTS:
+    Market: "${market.question}" (Vol: $${market.volume}, Liq: $${market.liquidity})
+    Trade: ${trade.side} $${trade.size} of "${trade.outcomeLabel}" at ${(trade.price * 100).toFixed(1)} cents.
+    Wallet Age: ${walletStats ? walletStats.accountAgeDays + ' days' : 'Unknown'}.
+    Flags: ${JSON.stringify(preliminaryFactors)}.
 
     TASK:
-    Assess if this trade indicates informed insider flow.
-    - High suspicion if: Fresh wallet (<2 days) AND large size OR known insider pattern.
-    - Medium suspicion if: High slippage acceptance or unusual outcome accumulation.
-    
-    Return ONLY JSON.
+    Determine if this specific trade represents potential insider activity or informed flow.
+    - Rate suspicion 0-100.
+    - Provide a concise reasoning based on Z-score, liquidity impact, and wallet freshness.
+    - Risk Level: LOW/MEDIUM/HIGH/CRITICAL.
+
+    Return JSON matching schema.
   `;
 
   try {

@@ -1,10 +1,24 @@
-import { PolymarketMarket, Trade } from '../types';
+import { PolymarketMarket, Trade, MarketStats } from '../types';
 
-const GAMMA_API_URL = 'https://gamma-api.polymarket.com';
-const DATA_API_URL = 'https://data-api.polymarket.com';
+const getProxyState = () => localStorage.getItem('ps_local_proxy') === 'true';
 
-// Heuristic constants
-const WHALE_THRESHOLD = 5000; // USD
+export const setLocalProxyMode = (enabled: boolean) => {
+  console.log(`[PolySleuth] Local Proxy Mode set to: ${enabled}`);
+  localStorage.setItem('ps_local_proxy', enabled.toString());
+};
+
+const getBaseUrls = () => {
+  if (getProxyState()) {
+    return {
+      gamma: 'http://localhost:8011/proxy',
+      data: 'http://localhost:8010/proxy'
+    };
+  }
+  return {
+    gamma: 'https://gamma-api.polymarket.com',
+    data: 'https://data-api.polymarket.com'
+  };
+};
 
 const safeParse = (input: any, fallback: any) => {
   if (!input) return fallback;
@@ -14,283 +28,204 @@ const safeParse = (input: any, fallback: any) => {
       const trimmed = input.trim();
       if (trimmed === '' || (trimmed[0] !== '[' && trimmed[0] !== '{')) return fallback;
       return JSON.parse(trimmed);
-    } catch (e) {
-      console.warn("JSON Parse warning for input:", input);
-      return fallback;
-    }
+    } catch (e) { return fallback; }
   }
   return fallback;
 };
 
-// MOCK DATA FOR FALLBACK
-const MOCK_MARKETS: PolymarketMarket[] = [
-  {
-    id: "0x4b7e56993f4e304602f90119109002231b67039031c6e10817094033324546", // Fake conditionId
-    gammaId: "mock-1",
-    question: "Venezuelan Presidential Election 2024 Winner?",
-    slug: "venezuela-election-2024",
-    endDate: "2024-12-31",
-    volume: 15420000,
-    liquidity: 450000,
-    outcomes: ["Maduro", "Gonzalez", "Other"],
-    outcomePrices: ["0.22", "0.75", "0.03"]
-  },
-  {
-    id: "0x8920194830192830192830192830192830192830192830192830192830192", 
-    gammaId: "mock-2",
-    question: "Fed Interest Rate Cut in September?",
-    slug: "fed-rates-sept",
-    endDate: "2024-09-18",
-    volume: 52000000,
-    liquidity: 1200000,
-    outcomes: ["Yes", "No"],
-    outcomePrices: ["0.65", "0.35"]
-  }
-];
-
-export const getTrendingMarkets = async (): Promise<PolymarketMarket[]> => {
-  try {
-    const response = await fetch(`${GAMMA_API_URL}/events?limit=20&sort=volume&order=desc&closed=false`);
-    
-    const contentType = response.headers.get("content-type");
-    if (!response.ok || !contentType || !contentType.includes("application/json")) {
-      console.warn("Polymarket API unreachable or blocked (CORS). Using Simulation Mode.");
-      return MOCK_MARKETS;
-    }
-    
-    const data = await response.json();
-    
-    const markets: PolymarketMarket[] = [];
-    if (Array.isArray(data)) {
-      data.forEach((event: any) => {
-        if (event.closed) return;
-
-        if (Array.isArray(event.markets)) {
-          event.markets.forEach((m: any) => {
-            if (m.closed) return;
-
-            // Important: Use conditionId as the primary ID for Data API compatibility
-            const conditionId = m.conditionId; 
-            if (!conditionId) return;
-
-            const outcomes = safeParse(m.outcomes, ["Yes", "No"]);
-            const outcomePrices = safeParse(m.outcomePrices, ["0.5", "0.5"]);
-            
-            // robust number parsing
-            const vol = Number(m.volumeNum || m.volume || 0);
-            const liq = Number(m.liquidityNum || m.liquidity || 0);
-
-            markets.push({
-              id: conditionId, // This is what /trades expects
-              gammaId: m.id,   // Keep for linking
-              question: m.question,
-              slug: m.slug,
-              endDate: m.endDate,
-              volume: isNaN(vol) ? 0 : vol,
-              liquidity: isNaN(liq) ? 0 : liq,
-              outcomes: outcomes,
-              outcomePrices: outcomePrices,
-            });
-          });
+const fetchWithCorsFallback = async (url: string) => {
+  const isLocal = getProxyState();
+  
+  if (isLocal) {
+    console.log(`[PolySleuth] Sending Request: ${url}`);
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
         }
       });
+      
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => "No error body");
+        console.error(`[PolySleuth] Proxy status ${response.status}:`, errorBody);
+        throw new Error(`Proxy error ${response.status}: ${errorBody}`);
+      }
+      return response;
+    } catch (e: any) {
+      console.error(`[PolySleuth] Proxy Fetch Error: ${e.message}`);
+      throw e;
     }
+  }
 
-    return markets.length > 0 ? markets : MOCK_MARKETS;
-  } catch (error) {
-    console.warn("Error fetching markets (likely CORS). Switching to Simulation Mode.", error);
-    return MOCK_MARKETS;
+  const PROXIES = [
+    (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`
+  ];
+
+  for (const proxyGen of PROXIES) {
+    try {
+      const proxyUrl = proxyGen(url);
+      const response = await fetch(proxyUrl);
+      if (response.ok) return response;
+    } catch (e) { continue; }
+  }
+  throw new Error(`CORS Blocked`);
+};
+
+export const getTrendingMarkets = async (useSimulation: boolean): Promise<PolymarketMarket[]> => {
+  if (useSimulation) return []; 
+  const { gamma } = getBaseUrls();
+
+  try {
+    /** 
+     * FIXED: The 422 error "order fields are not valid" is caused by 
+     * the Gamma API rejecting the 'sort' and 'order' parameters 
+     * in combination with 'active=true'. 
+     * We use a simplified query that is guaranteed to return data.
+     */
+    const url = `${gamma}/markets?active=true&limit=50`;
+    const response = await fetchWithCorsFallback(url);
+    const data = await response.json();
+    const markets: PolymarketMarket[] = [];
+
+    if (Array.isArray(data)) {
+      data.forEach((m: any) => {
+        const cid = m.conditionId || m.id;
+        if (!cid) return;
+        markets.push({
+          id: cid,
+          gammaId: m.id,
+          question: m.question,
+          slug: m.slug,
+          endDate: m.endDate,
+          volume: Number(m.volume || 0),
+          liquidity: Number(m.liquidity || 0),
+          outcomes: safeParse(m.outcomes, ["Yes", "No"]),
+          outcomePrices: safeParse(m.outcomePrices, ["0.5", "0.5"]),
+        });
+      });
+    }
+    console.log(`[PolySleuth] Market Data Success. Received ${markets.length} results.`);
+    return markets;
+  } catch (error: any) {
+    console.error("[PolySleuth] Market Load Failed", error.message);
+    return [];
   }
 };
 
-/**
- * Normalizes timestamp to milliseconds.
- */
-const normalizeTimestamp = (ts: number): number => {
-  if (ts < 10000000000) return ts * 1000; // It's in seconds
-  return ts; // It's in milliseconds
-};
-
-export const fetchRecentTrades = async (markets: PolymarketMarket[]): Promise<Trade[]> => {
+export const fetchRecentTrades = async (markets: PolymarketMarket[], useSimulation: boolean): Promise<Trade[]> => {
+  if (markets.length === 0 || useSimulation) return [];
+  
+  const { data: dataUrl } = getBaseUrls();
   const trades: Trade[] = [];
   const now = Date.now();
-  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const WINDOW_MS = 86400000; // 24 hours
 
-  // 1. Batch fetch for top 20 markets to avoid N+1 problem
-  const targetMarkets = markets.slice(0, 20);
-  const conditionIds = targetMarkets.map(m => m.id).join(',');
-  
-  // Real API Attempt
   try {
-      // Fetch 200 most recent trades across all these markets
-      const response = await fetch(`${DATA_API_URL}/trades?market=${conditionIds}&limit=200&takerOnly=true`);
-      if (response.ok) {
-          const realData = await response.json();
-          if (Array.isArray(realData)) {
-              realData.forEach((t: any) => {
-                  const ts = normalizeTimestamp(t.timestamp);
-                  
-                  // Find the market this trade belongs to
-                  const market = targetMarkets.find(m => m.id === t.conditionId);
-                  
-                  if (market && ts > now - ONE_HOUR_MS) {
-                       trades.push({
-                          // Composite ID for robustness
-                          id: `${t.transactionHash}-${t.outcomeIndex}-${t.timestamp}`,
-                          marketId: market.id,
-                          marketQuestion: market.question,
-                          outcomeIndex: parseInt(t.outcomeIndex), 
-                          outcomeLabel: t.outcome || "Outcome",
-                          side: t.side || 'BUY',
-                          price: parseFloat(t.price),
-                          size: parseFloat(t.size),
-                          timestamp: ts,
-                          // Correct mapping from Data API (proxyWallet is usually the actor)
-                          makerAddress: t.proxyWallet || t.maker_address || generateRandomWallet(),
-                          transactionHash: t.transactionHash || "0x..."
-                       });
-                  }
-              });
-          }
-      }
-  } catch (e) {
-    // CORS or network error - fall through to simulation
-    // console.log("Real trade fetch failed, likely CORS");
-  }
-
-  // 2. Fallback: If no real data, simulate LIVE traffic
-  if (trades.length < 2) {
-      markets.forEach(market => {
-        const activityChance = market.volume > 1000000 ? 0.3 : 0.1;
-        if (Math.random() < activityChance) {
-          const isWhale = Math.random() > 0.95;
-          const size = isWhale ? 
-            Math.floor(Math.random() * 40000) + 5000 : 
-            Math.floor(Math.random() * 2000) + 100;
-          const outcomeIdx = Math.floor(Math.random() * market.outcomes.length);
-          
-          let price = 0.5;
-          if (Array.isArray(market.outcomePrices) && market.outcomePrices[outcomeIdx]) {
-             const p = parseFloat(market.outcomePrices[outcomeIdx]);
-             if (!isNaN(p)) price = p;
-          }
-
-          trades.push({
-            id: Math.random().toString(36).substring(7),
-            marketId: market.id,
-            marketQuestion: market.question,
-            outcomeIndex: outcomeIdx,
-            outcomeLabel: market.outcomes[outcomeIdx] || 'Yes',
-            side: 'BUY',
-            price: price,
-            size: size,
-            timestamp: now - Math.floor(Math.random() * 15000), 
-            makerAddress: generateRandomWallet(),
-            transactionHash: '0x' + Math.random().toString(36).substring(2),
+      // Use top 8 markets to keep query string safe and focused
+      const targetMarkets = markets.slice(0, 8);
+      const conditionIds = targetMarkets.map(m => m.id).join(',');
+      
+      // Removed takerOnly=true to capture all liquidity interactions
+      const url = `${dataUrl}/trades?market=${conditionIds}&limit=100`;
+      
+      const response = await fetchWithCorsFallback(url);
+      const realData = await response.json();
+      
+      if (Array.isArray(realData)) {
+          console.log(`[PolySleuth] Trade API returned ${realData.length} raw records.`);
+          realData.forEach((t: any) => {
+              const ts = t.timestamp < 10000000000 ? t.timestamp * 1000 : t.timestamp;
+              const market = targetMarkets.find(m => m.id === t.conditionId);
+              
+              if (market && ts > now - WINDOW_MS) {
+                    trades.push({
+                      id: `${t.transactionHash}-${t.outcomeIndex}-${t.timestamp}`,
+                      marketId: market.id,
+                      marketQuestion: market.question,
+                      outcomeIndex: parseInt(t.outcomeIndex), 
+                      outcomeLabel: t.outcome || "Outcome",
+                      side: t.side || 'BUY',
+                      price: parseFloat(t.price),
+                      size: parseFloat(t.size),
+                      timestamp: ts,
+                      makerAddress: t.proxyWallet || t.maker_address,
+                      transactionHash: t.transactionHash
+                    });
+              }
           });
-        }
-      });
+      }
+      console.log(`[PolySleuth] Scan Results: Found ${trades.length} valid trades within 24h window.`);
+      return trades.sort((a, b) => b.timestamp - a.timestamp);
+  } catch (e: any) { 
+    console.error("[PolySleuth] Trade Fetch Failed", e.message);
+    return []; 
   }
-
-  return trades.sort((a, b) => b.timestamp - a.timestamp);
 };
 
-export const fetchWalletStats = async (address: string) => {
-  // Real implementation attempting to hit data-api
+export const fetchWalletStats = async (address: string, useSimulation: boolean) => {
+  if (useSimulation) return { totalTrades: 50, winRate: 0.65, accountAgeDays: 2 };
+  const { data: dataUrl } = getBaseUrls();
   try {
-    const response = await fetch(`${DATA_API_URL}/activity?user=${address}&limit=1&sortDirection=ASC`);
+    const url = `${dataUrl}/activity?user=${address}&limit=1&sortDirection=ASC`;
+    const response = await fetchWithCorsFallback(url);
     if (response.ok) {
       const activity = await response.json();
       if (Array.isArray(activity) && activity.length > 0) {
-        const firstSeen = normalizeTimestamp(activity[0].timestamp);
-        const now = Date.now();
-        const ageDays = (now - firstSeen) / (1000 * 60 * 60 * 24);
-        
-        return {
-          totalTrades: -1, 
-          winRate: 0, 
-          accountAgeDays: parseFloat(ageDays.toFixed(2))
-        };
+        const firstSeen = activity[0].timestamp < 10000000000 ? activity[0].timestamp * 1000 : activity[0].timestamp;
+        return { totalTrades: -1, winRate: 0, accountAgeDays: (Date.now() - firstSeen) / 86400000 };
       }
     }
-  } catch (e) {
-    // console.warn("Wallet stats fetch failed", e);
-  }
-  
-  // Fallback if API fails
-  return {
-    totalTrades: Math.floor(Math.random() * 50),
-    winRate: 0.5,
-    accountAgeDays: Math.floor(Math.random() * 30)
-  };
+  } catch (e) {}
+  return undefined;
 };
 
-export const generateBacktestScenario = (): Trade => {
-  const market = MOCK_MARKETS[0];
-  const now = Date.now();
-  
-  return {
-    id: "sim-maduro-whale",
-    marketId: market.id,
-    marketQuestion: market.question,
-    outcomeIndex: 0,
-    outcomeLabel: "Maduro",
-    side: 'BUY',
-    price: 0.12, 
-    size: 35000, 
-    timestamp: now - (1000 * 60 * 60 * 4), 
-    makerAddress: "0x31a56e9E690c621eD21De08Cb559e9524Cdb8eD9",
-    transactionHash: "0xBacktestScenarioHash123"
-  };
+export const fetchMarketWhales = async (marketId: string, useSimulation: boolean): Promise<string[]> => {
+  if (useSimulation) return [];
+  const { data: dataUrl } = getBaseUrls();
+  try {
+    const url = `${dataUrl}/holders?market=${marketId}`;
+    const response = await fetchWithCorsFallback(url);
+    if (response.ok) {
+      const holders = await response.json();
+      if (Array.isArray(holders)) {
+        return holders.slice(0, 10).map((h: any) => (h.proxyWallet || h.address || "").toLowerCase());
+      }
+    }
+  } catch (e) {}
+  return [];
 };
 
-const generateRandomWallet = () => {
-  const chars = '0123456789ABCDEF';
-  let address = '0x';
-  for (let i = 0; i < 40; i++) {
-    address += chars[Math.floor(Math.random() * 16)];
-  }
-  return address;
+export const generateBacktestScenario = (): Trade => ({
+  id: "sim-maduro-whale",
+  marketId: "0x4b7e56993f4e304602f90119109002231b67039031c6e10817094033324546",
+  marketQuestion: "[DEMO] Venezuelan Election 2024 Winner?",
+  outcomeIndex: 0,
+  outcomeLabel: "Maduro",
+  side: 'BUY',
+  price: 0.12, 
+  size: 35000, 
+  timestamp: Date.now() - 14400000, 
+  makerAddress: "0x31a56e9E690c621eD21De08Cb559e9524Cdb8eD9",
+  transactionHash: "0xBacktestScenarioHash123"
+});
+
+export const calculateDynamicZScore = (size: number, stats?: MarketStats) => {
+  if (!stats || stats.count < 5) return (size - 200) / 300;
+  const stdDev = Math.sqrt(stats.m2Size / stats.count);
+  return stdDev === 0 ? 0 : (size - stats.meanSize) / stdDev;
 };
 
-// Statistical Anomaly Detection (Z-Score approximation)
-const calculateZScore = (size: number, avgSize: number = 500) => {
-  const stdDev = avgSize * 1.5; 
-  return (size - avgSize) / stdDev;
-};
-
-export const analyzeTradeHeuristics = (trade: Trade, market: PolymarketMarket) => {
+export const analyzeTradeHeuristics = (trade: Trade, market: PolymarketMarket, stats?: MarketStats, isWhale?: boolean) => {
   const factors: string[] = [];
   let baseScore = 0;
-
-  // 1. Z-Score / Statistical Anomaly
-  const zScore = calculateZScore(trade.size, 500);
-  
-  if (zScore > 3) {
-    baseScore += 30;
-    factors.push(`Statistically Significant Size (Z=${zScore.toFixed(1)})`);
-  }
-
-  // 2. Liquidity Impact
-  if (market.liquidity > 0) {
-      const impactRatio = trade.size / market.liquidity;
-      if (impactRatio > 0.01) { 
-          baseScore += 25;
-          factors.push(`High Market Impact (>1% Liq)`);
-      }
-  }
-
-  // 3. Contrarian / "Smart Money" Check
-  if (trade.price < 0.20 && trade.size > 1000) {
-    baseScore += 20;
-    factors.push(`Deep Value Accumulation (<20¢)`);
-  }
-  
-  // 4. Insider Wallet Checks
-  if (trade.makerAddress.toLowerCase() === "0x31a56e9E690c621eD21De08Cb559e9524Cdb8eD9".toLowerCase()) {
-    baseScore += 50;
-    factors.push("Known Insider Wallet");
-  }
-
+  const zScore = calculateDynamicZScore(trade.size, stats);
+  if (zScore > 3) { baseScore += 35; factors.push(`High Size Z=${zScore.toFixed(1)}`); }
+  if (market.liquidity > 0 && (trade.size / market.liquidity) > 0.01) { baseScore += 25; factors.push(`Significant Liquidity Impact`); }
+  if (trade.price < 0.20 && trade.size > 200) { baseScore += 20; factors.push(`Speculative Accumulation`); }
+  if (isWhale) { baseScore += 30; factors.push("Verified Whale Activity"); }
+  if (trade.makerAddress.toLowerCase() === "0x31a56e9E690c621eD21De08Cb559e9524Cdb8eD9".toLowerCase()) { baseScore += 50; factors.push("Blacklisted/Known Insider"); }
   return { baseScore, factors };
 };
