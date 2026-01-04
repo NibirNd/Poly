@@ -1,0 +1,5 @@
+{
+  "name": "PolySleuth - Insider Tracker",
+  "description": "A real-time forensic tool for Polymarket that detects potential insider trading activity using algorithmic heuristics and Gemini AI analysis.",
+  "requestFramePermissions": []
+}
